@@ -1,0 +1,333 @@
+---
+title: "Appendix (Code)"
+author: "Sergio Arnaud"
+date: "10 january, 2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse) 
+
+library(corrplot)
+require(gridExtra)
+
+library(caret)
+library(xgboost)
+
+library(xgboostExplainer) #install_github("AppliedDataSciencePartners/xgboostExplainer")
+```
+
+# Reading and exploring the data
+Reading data
+```{r}
+data <- read_csv('CCPP/data.csv')
+summary(data)
+```
+
+The data dimensions are 9568,5. We have 1231 observations of 5 variables which are:
+- Temperature (T)
+- Ambient Pressure (AP)
+- Relative Humidity (RH)
+- Exhaust Vacuum (V)
+- Electrical energy output (EP) 
+
+Each variable is continous and the Electrical energy output is the variable to predict.
+
+# Variables
+The response variable `PE`, the net hourly electrical energy output of the plant has the following distribution.
+```{r}
+ggplot(data=data, aes(x=PE)) +
+        geom_histogram(binwidth = 1) +
+        scale_x_continuous(breaks= seq(410, 500, by=5)) +
+        xlab('Electrical energy output') 
+```
+And the distributions of the 5 variables are
+```{r}
+p1 <- ggplot(data=data, aes(x=AT)) +
+      geom_histogram(binwidth = 1) +
+      scale_x_continuous(breaks= seq(min(data$AT), max(data$AT), by=5))+
+      xlab('Ambient temperature') 
+    
+p2 <- ggplot(data=data, aes(x=V)) +
+      geom_histogram(binwidth = 1) +
+      scale_x_continuous(breaks= seq(min(data$V), max(data$V), by=8))+
+      xlab('Exhaust Vacuum') 
+
+p3 <- ggplot(data=data, aes(x=AP)) +
+      geom_histogram(binwidth = 1) +
+      scale_x_continuous(breaks= seq(min(data$AP), max(data$AP), by=8))+
+      xlab(' Ambient Pressure') 
+
+p4 <- ggplot(data=data, aes(x=RH)) +
+      geom_histogram(binwidth = 1) +
+      scale_x_continuous(breaks= seq(min(data$RH), max(data$RH), by=10))+
+      xlab('Relative Humidity') 
+
+p5 <- ggplot(data=data, aes(x=PE)) +
+        geom_histogram(binwidth = 1) +
+        scale_x_continuous(breaks= seq(410, 500, by=5)) +
+        xlab('Electrical energy output') 
+
+grid.arrange(grobs = list(p1,p2,p3,p4,p5), layout_matrix = rbind(c(1,2),
+                                                                 c(3,4),
+                                                                 c(5,5)))
+
+```
+
+# Relations of the predictors with the response variable
+
+First, let's take a look to the correlation matrix and, in particular, focus in the correlations of each variable with the response variable.
+```{r}
+correlations <- cor(data, use="pairwise.complete.obs") 
+
+cor_sorted <- sort(correlations[,'PE'], decreasing = TRUE)
+correlations <- correlations[names(cor_sorted), names(cor_sorted)]
+
+corrplot.mixed(correlations, tl.col="black", 
+               lower.col = gray.colors(100), 
+               upper.col = gray.colors(100))
+```
+And the plots relating each predictor with the response variable
+```{r}
+p1 <- ggplot(data=data, aes(x=AT, y=PE))+
+        geom_point() + 
+        geom_smooth(method = "lm", se=FALSE, color="grey", aes(group=1)) +
+        xlab('Ambient Temperature') +
+        ylab('Energy output')
+
+p2 <- ggplot(data=data, aes(x=V, y=PE))+
+        geom_point() + 
+        geom_smooth(method = "lm", se=FALSE, color="grey", aes(group=1)) +
+        xlab('Exhaust Vacuum') +
+        ylab('Energy output')
+
+p3 <- ggplot(data=data, aes(x=AP, y=PE))+
+        geom_point() + 
+        geom_smooth(method = "lm", se=FALSE, color="grey", aes(group=1)) +
+        xlab(' Ambient Pressure') +
+        ylab('Energy output')
+
+p4 <- ggplot(data=data, aes(x=RH, y=PE))+
+        geom_point() + 
+        geom_smooth(method = "lm", se=FALSE, color="grey", aes(group=1))+
+        xlab('Relative Humidity') +
+        ylab('Energy output')
+
+grid.arrange(p1,p2,p3,p4,ncol=2)
+```
+# Preparing data to modelling
+
+Splitting the data in train and test sets 
+```{r}
+set.seed(970628)
+trainIndex <- createDataPartition(1:length(data$AT), p=0.8, list=FALSE)
+
+#splitting data into training/testing data using the trainIndex object
+train_data <- data[trainIndex,] 
+test_data <- data[-trainIndex,] 
+
+dim(train_data)
+dim(test_data)
+
+train_data
+```
+
+It's important to underline that the data have no misssing values and it looks like we don't have to deal with outliers or further cleaning the data, well just standardise each variable.
+```{r}
+col_mean <- map(train_data, mean)
+col_sd <- map(train_data, sd)
+
+train_data <- train_data %>%
+    map2_df(col_mean, ~.x - .y) %>% # Remove mean
+    map2_df(col_sd, ~.x / .y) # Divide by sd
+
+test_data <- test_data %>% 
+    map2_df(col_mean, ~.x - .y) %>% 
+    map2_df(col_sd, ~.x / .y)
+
+```
+
+# Linear model
+```{r}
+lin_model <- lm(data = train_data, PE ~ .)
+summary(lin_model)
+```
+And the mean square error is
+```{r}
+ans_linear <- predict(lin_model, test_data %>% select(-PE))
+ans_linear <- test_data %>% mutate(real = PE, estimated = ans_linear) %>% select(real, estimated)
+ans_linear %>% mutate(mse = (real-estimated)^2) %>% summarise(mean(mse))
+```
+
+# Lasso 
+
+Cross validation to fix the lambda
+```{r, warning=FALSE}
+my_control <- trainControl(method="cv", number=5)
+lasso_grid <- expand.grid(
+                          alpha = 1,  # alpha = 1 lasso, # alpha = 0 ridge
+                          lambda = seq(0.001,1,by = 0.001)
+                          )
+
+lasso_model <- train(x = train_data %>% select(-PE), 
+                     y = train_data$PE,
+                     method='glmnet', 
+                     trControl = my_control, 
+                     tuneGrid = lasso_grid) 
+lasso_model$bestTune
+```
+
+Mean squared erro
+```{r}
+predictions_lasso <- predict(lasso_model, test_data %>% select(-PE))
+ans_lasso <- test_data %>% mutate(real = PE, estimated = predictions_lasso) %>% select(real, estimated)
+ans_lasso %>% mutate(mse = (real-estimated)^2) %>% summarise(mean(mse))
+```
+
+## XGBoost
+
+Caret hyper parameter tuning
+```{r, warning=FALSE}
+
+xgb_grid = expand.grid(
+    nrounds = 1000,
+    eta = c(0.3, 0.2, 0.1),
+    max_depth = c(3, 4, 5, 6),
+    gamma = 0,
+    colsample_bytree=1,
+    min_child_weight=c(1, 2, 3, 4),
+    subsample=1
+)
+
+xgb_caret <- train(x = train_data %>% select(-PE), 
+                     y = train_data$PE,
+                     method='xgbTree', 
+                     trControl = my_control, 
+                     tuneGrid = xgb_grid)
+```
+The results are
+```{r}
+head(xgb_caret$results)
+```
+
+And the best tune for the hyperparameters is
+```{r}
+xgb_caret$bestTune
+```
+
+Now let us find the ideal number of rounds
+```{r, warning=FALSE}
+label_train <- train_data$PE
+
+# put our testing & training data into two seperates Dmatrixs objects
+dtrain <- xgb.DMatrix(data = as.matrix(train_data %>% select(-PE)), label= label_train)
+dtest <- xgb.DMatrix(data = as.matrix(test_data %>% select(-PE)))
+
+default_param<-list(
+        objective = "reg:squarederror",
+        booster = "gbtree",
+        eta=0.1, 
+        gamma=0,
+        max_depth=6,
+        min_child_weight=2
+)
+
+xgbcv <- xgb.cv( params = default_param, data = dtrain, nrounds = 1000, nfold = 5, showsd = T, stratified = T, print_every_n = 40, early_stopping_rounds = 10, maximize = F)
+```
+
+The optimal number of rounds for the choice of hyper parameters is 598. Training the model with the optimal hyperparameters
+```{r}
+xgb_mod <- xgb.train(data = dtrain, params=default_param, nrounds = 598)
+```
+
+Predicting and evaluating the prediction results with the test dataset
+```{r}
+XGBpred <- predict(xgb_mod, dtest)
+ans_xgb <- test_data %>% mutate(real = PE, estimated = XGBpred) %>% select(real, estimated)
+ans_xgb %>% mutate(mse = (real-estimated)^2) %>% summarise(mean(mse))
+
+ggplot(data=ans_xgb, aes(x=estimated, y=real))+
+        geom_point() + 
+        geom_smooth(method = "lm", se=FALSE, color="grey", aes(group=1)) +
+        ylab('Actual energy output') +
+        xlab('Predicted energy output')
+
+```
+
+Plotting the variable importance
+```{r}
+library(Ckmeans.1d.dp) #required for ggplot clustering
+mat <- xgb.importance (feature_names = colnames(train_data),model = xgb_mod)
+xgb.ggplot.importance(importance_matrix = mat, rel_to_first = TRUE)
+```
+
+Building explainer of results
+```{r, results = 'hide', error=FALSE, warning=FALSE, message=FALSE}
+explainer = buildExplainer(xgb_mod, dtrain, type="binary", base_score = 0.5, trees_idx = NULL)
+pred.breakdown = explainPredictions(xgb_mod, explainer, dtest)
+colnames(pred.breakdown) <- paste("pred", colnames(pred.breakdown), sep = "_")
+```
+
+Each plot in the following figure shows the values of a feature plotted against the impact associated with that value.
+```{r}
+expl_data <- cbind(test_data, pred.breakdown)
+expl_data <- expl_data %>% mutate(Temperature = ifelse(AT > 0, "high", "low"))
+
+p1 <- ggplot(data=expl_data, aes(x=AT, y=pred_AT))+
+        geom_point() + 
+        xlab('Ambient Temperature') +
+        ylab('AT impact on log-odds')
+
+p2 <- ggplot(data=expl_data, aes(x=V, y=pred_V))+
+        geom_point()  + 
+        xlab('Exhaust Vacuum') +
+        ylab('EV impact on log-odds')
+
+p3 <- ggplot(data=expl_data, aes(x=AP, y=pred_AP))+
+        geom_point() + 
+        xlab('Ambient Preasure') +
+        ylab('AP impact on log-odds')
+
+p4 <- ggplot(data=expl_data, aes(x=RH, y=pred_RH))+
+        geom_point() + 
+        xlab('Relative Humidity') +
+        ylab('RH impact on log-odds')
+
+grid.arrange(p1,p2,p3,p4,ncol=2)
+```
+
+Each plot in the following figure shows the values of a feature plotted agains the impact associated with that value. Colored by low or high temperature.
+```{r}
+p1 <- ggplot(data=expl_data, aes(x=V, y=pred_V, col = Temperature))+
+        geom_point() + 
+        xlab('Exhaust Vacuum') +
+        ylab('EV importance on log-odds')
+
+p2 <- ggplot(data=expl_data, aes(x=RH, y=pred_RH, col = Temperature))+
+        geom_point() + 
+        xlab('Relative Humidity') +
+        ylab('RH importance on log-odds')
+
+grid.arrange(p2,p1,ncol=1)
+```
+
+Ilustrating how a single observation is built
+```{r}
+showWaterfall(xgb_mod, explainer, dtest, test_data,  8, type = "binary")
+```
+
+
+
+
+
+
+
+
+
+
