@@ -1,0 +1,500 @@
+---
+title: "Statistical learning (MT7038) - Project 1"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+***
+
+**Instructions:** *This project consists of five tasks that should be solved individually. You are free to copy and modify code used in the project template file `MT7038_project1_VT19.Rmd` without further reference, but any code inspired by fellow students or other sources must be clearly acknowledged. Use of specific R-packages apart from those used in the template (the `tidyverse`-suite, `rpart` and `rpart.plot`) requires permission from course staff.*
+
+*The solution should be submitted at the course web page as a source markdown file together with a compiled pdf.*
+
+***
+
+This project mainly aims at introducing a tidy (in the `tidyverse` sense) workflow in approaching statistical learning projects. There are R-packages designed to streamline such work, notably the `caret` package and tools under construction in `tidymodels`, but these tend to hide much detail under the hood. Instead, we will do much of the workflow-coding using data-manipulation tools from the `tidyverse`, in particular we will make excessive use of the `map*`-functions from `purrr` and list columns from `tibble`. If you are unfamiliar with the tools of the `tidyverse` suite of packages, you have most likely not participated in the prerequisite course Statistical data processing (MT5013) but argued that you have corresponding knowledge. Now is the time to show that you do. It is not required to use `tidyverse` tools in your solutions, all could be written in base R using loops or the `apply`-family of functions, but we will not offer a base R template.
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse) # For data manipulation
+library(rpart) # For trees in later part
+library(rpart.plot) # For trees in later part
+theme_set(theme_minimal()) # ggplot theme, set as you like
+```
+
+We will use the Prostate Cancer data described in section 3.2.1 of the textbook, where the aim is to predict level of prostate-specific antigen (`lpsa`) from a number of clinical measures. Data is available at the textbook webpage and downloaded by
+```{r, message=FALSE, warning=FALSE}
+# Import
+url <- "https://web.stanford.edu/~hastie/ElemStatLearn/datasets/prostate.data"
+prostate_raw <- read_tsv(url) %>% select(-X1)
+glimpse(prostate_raw)
+```
+
+As you can see, data has been split into a train and test set through the `train` column. We will keep this split and store the test set in a separate table for a final evaluation of model performance.
+
+```{r, message=FALSE, warning=FALSE}
+# Split into separate tables
+prostate_raw_train<- prostate_raw %>% 
+    filter(train) %>% 
+    select(-train)
+prostate_raw_test <- prostate_raw %>% 
+    filter(!train) %>% 
+    select(-train)
+```
+
+An important next step would be data exploration (of the training set) and preprocessing, we will skip most of this in the assignment and just
+
+- standardise variables by removing mean and dividing by standard deviation (necessary for some methods, in particular for ridge regression that we will use).
+- randomly reorder observations (always a good idea).
+
+Always set a random seed to ensure your results can be reproduced.
+```{r}
+set.seed(970628)
+
+# Prepare by scaling and random reordering
+col_mean <- map(prostate_raw_train, mean)
+col_sd <- map(prostate_raw_train, sd)
+prostate_prep_train <- prostate_raw_train %>%
+    map2_df(col_mean, ~.x - .y) %>% # Remove mean
+    map2_df(col_sd, ~.x / .y) %>% # Divide by sd
+    slice(sample(1:n())) # Random reordering
+
+prostate_prep_test <- prostate_raw_test %>% 
+    map2_df(col_mean, ~.x - .y) %>% 
+    map2_df(col_sd, ~.x / .y)
+
+```
+
+***
+
+**Task 1**
+
+*In the above code, the mean and standard deviation of the training set was used to standardise the test set. Argue why this is a good idea.*
+
+We could do the normalization in three diferent ways:
+
+1) use the global mean sd to normalize both the test and train datasets
+2) use the train mean sd to normalize the train set and the test mean sd to normalize the test set
+3) use the mean and standard deviation of the training set to standarise both.
+
+We will argue why both 1) and 2) are the wrong ways. The first one uses information from the test set, that's kind of cheating. If we remember the cross-validation chapter of the ESL, the information from the test set has to be kept in a 'vault' and we shouldn't use it until we want to evaluate the performance of our model. This is similar to the case "the wrong way to do cross validation".
+
+The second case induces inmediatly a bias. Indeed, suppose that we an observation in the train set and, then, when have the exact same observation in the test set. Since we are using different scalings they would have different values and be treated by the model differently (when it shouldn't)
+
+That's why the third case is the only plausible.
+***
+
+Given a huge data set, we could split training data into a fixed training and validation set that can be used for model fitting and validation respectively. Ours is kind of small, and we will use cross validation to improve performance.
+
+### Cross-validation
+
+The function `cv_fold` below splits data into `n_fold` folds and places the corresponding train/test-sets in a tidy data frame. This is our first use of list-columns, columns that are not atomic vectros. Each row will contain one fold and the `train` and `test` columns will contain the full train/test data for each fold (do not confuse this use of train/test with the  separate tables constructed above). While this may not be very efficient in terms of memory storage, it is very convenient for further analysis.
+
+```{r}
+cv_fold <- function(data, n_fold){
+    # fold_id denotes in which fold the observation
+    # belongs to the test set
+    data <- mutate(data, fold_id = rep_len(1:n_fold, length.out = n()))
+    # Two functions to split data into train and test sets
+    cv_train <- function(fold, data){
+        filter(data, fold_id != fold) %>% 
+            select(- fold_id)
+    }
+    cv_test <- function(fold, data){
+        filter(data, fold_id == fold) %>% 
+            select(- fold_id)
+    }
+    # Folding
+    tibble(fold = 1:n_fold) %>% 
+        mutate(train = map(fold, ~cv_train(.x, data)),
+               test = map(fold, ~cv_test(.x, data)),
+               fold = paste0("Fold", fold))
+}
+```
+
+We now apply it to the training data using 10 folds, any further tuning should be based on the resulting `cv_prostate` data frame.
+
+```{r}
+n_fold <- 10
+cv_prostate <- cv_fold(prostate_prep_train, 10)
+glimpse(cv_prostate)
+```
+
+Make sure you understand the structure of `cv_prostate`!
+
+### Fitting a ridge regression model
+
+We will now fit models to each of the rows of the `train` column and validate on the `test` column. In this example we will fit a ridge regression model using function `lm.ridge` below, where we have chosen to use R´s `formula` class to define response and covariates. 
+
+```{r}
+lm.ridge <- function(data, formula, lambda){
+    # Given data, model formula and shrinkage parameter lambda,
+    # this function returns a data.frame of estimated coefficients
+    X <- model.matrix(formula, data) # Exctract design matrix X
+    p <- ncol(X)
+    y <- model.frame(formula, data) %>% # Extract vector of responses y
+        model.extract("response")
+    # Compute parameter estimates (Eq. (3.44) in textbook)
+    R <- t(X) %*% X
+    solve(R + lambda * diag(p)) %*% t(X) %*% as.matrix(y) %>% 
+        as.data.frame() %>% 
+        setNames("estimate") %>% 
+        rownames_to_column("variable")
+}
+```
+
+We will also need a function that predicts the response given a new set of explanatory variables `newdata`, a model fit (parameter estimates) as returned by `lm.ridge` and the `formula` used for fitting the model.
+
+```{r}
+predict.ridge <- function(newdata, fit, formula){
+    model.matrix(formula, data = newdata) %*% as.matrix(fit$estimate) %>% 
+        as.numeric()
+}
+```
+
+We will fit a model with all explanatory variables (denoted by `.`) and without an intercept (denoted by `-1`) since we have standardised the response variable `lpsa`
+
+```{r}
+formula <- lpsa ~ -1 + .
+```
+
+and for a sequence of values for the hyperparameter $\lambda$
+
+```{r}
+lambda_seq <- exp(seq(-.5, log(10), length.out = 20)) 
+lambda_seq
+```
+
+The following few lines now fits the model to training data for each combination of $lambda$ in `lambda_seq` and cross-validation fold (`model_fit` column), computes predictions for the corresponding test data (`predicted` column), extracts the observed response variables from the test sets (`actual` column) and finally computes the mean squared error `mse` as the mean squared difference between `actual` and `predicted`
+
+```{r}
+model_df <- cv_prostate %>% 
+    # One row for each combination of lambda and fold
+    crossing(lambda = lambda_seq) %>% 
+    # Fit model to training data in each row
+    mutate(model_fit = map2(train, lambda, ~lm.ridge(.x, formula, .y)),
+           # Compute predicted valuea on test data
+           predicted = map2(test, model_fit, ~predict.ridge(.x, .y, formula)),
+           # Extract actual values from test data
+           actual = map(test, ~(model.frame(formula, .x) %>% 
+                                    model.extract("response"))),
+           # Compute mse 
+           mse = map2_dbl(predicted, actual, ~mean((.x - .y)^2)))
+glimpse(model_df)
+```
+
+We are now ready to illustrate e.g. mean squared error as a function of hyperparameter by averaging over the folds for exach value of `lambda`
+
+```{r}
+model_df %>%
+    group_by(lambda) %>% 
+    summarise(mse = mean(mse)) %>% 
+    ggplot(aes(x = lambda, y = mse)) + 
+    geom_point() + 
+    geom_line()
+```
+
+Now everyone
+
+```{r}
+model_df %>%
+    ggplot(aes(x = lambda, y = mse, group = fold)) + 
+    geom_point(aes(color=fold)) + 
+    geom_line(aes(color=fold)) 
+```
+
+
+The effect of shrinkage of $lambda$ on the coefficients
+
+```{r}
+model_df %>% 
+    unnest(model_fit) %>% 
+    group_by(lambda, variable) %>% 
+    summarise(mean_estimate = mean(estimate)) %>% 
+    ggplot(aes(x = lambda, y = mean_estimate, color = variable)) +
+    geom_line() +
+    geom_point()
+```
+
+Or simply find the optimal $lambda$
+
+```{r}
+best_lambda <- model_df %>% 
+    group_by(lambda) %>% 
+    summarise(mse = mean(mse)) %>% 
+    top_n(1, -mse) %>% 
+    pull(lambda)
+best_lambda
+```
+and plot predicted against observed for the test data and compute test mse fo this choice of `lambda`
+```{r}
+best_model <- lm.ridge(prostate_prep_train, formula, best_lambda)
+prostate_prep_test %>% mutate(predicted = predict.ridge(., best_model, formula),
+                              actual = model.frame(formula, .) %>% 
+                                  model.extract("response")) %>%
+    ggplot(aes(x = predicted, y = actual)) + 
+    geom_point()
+prostate_prep_test %>% mutate(predicted = predict.ridge(., best_model, formula),
+                              actual = model.frame(formula, .) %>% 
+                                  model.extract("response")) %>%
+    summarise(mse = mean((predicted - actual)^2))
+```
+
+
+***
+
+**Task 2**
+
+*Change the random seed to your date of birth (yymmdd). Rerun the analysis and compare the figure of mse versus lambda with the one in this sheet, you may need to adapt `lambda_seq` in order to fit the minimum within the range of lambdas. Does the optimal lambda seem to be sensitive to the random splitting in folds? Plot the mse for each fold (rather than the average) in the same figure and report any conclusions.*
+
+***
+
+# Trees
+
+With the function `rpart` in the `rpart` library you can grow a regression tree. For a simple example we just use `lcavol` as explanatory variable
+```{r}
+fit1 <- rpart(lpsa ~ lcavol, data = prostate_prep_train, control = rpart.control(cp = 0))
+fit1
+rpart.plot(fit1)
+```
+
+This gives six terminal nodes, since by default growth stops when there are less than 20 observations in a node (setting `cp = 0` avoids premature pruning). Using `rpart.control` we can set our own stopping criteria
+```{r}
+fit2 <- rpart(lpsa ~ lcavol, data = prostate_prep_train, control = rpart.control(minsplit = 10, cp = 0))
+fit2
+rpart.plot(fit2)
+```
+which grows a larger tree. We may use `predict` to visualise the step functions fitted 
+```{r}
+prostate_prep_train %>% mutate(minsplit20 = predict(fit1), 
+                  minsplit10 = predict(fit2))%>% 
+    gather(key = Method, value = Predicted, minsplit20:minsplit10) %>% 
+    ggplot() + geom_point(aes(x = lcavol, y = lpsa)) +
+    geom_step(aes(x = lcavol, y = Predicted, color = Method))
+```
+ 
+Evidently, the large tree (`minsplit = 10`) overfits data. Pruning of trees is done with `prune`, which minimises the cost complexity criterion (eq. (9.16) in ESL) for a given complexity parameter $\alpha=$`cp`. Pruning with `cp = 0.1` gives the smaller
+```{r}
+fit3 <- prune(fit2, cp = 0.1)
+```
+
+***
+
+**Task 3**
+
+*Find a (near) optimal value for `cp` using cross-validation by applying techniques as in Taks 2 to the `cv_prostate` data.frame. Use all variables (`formula = lpsa ~ .`) rather than just `lpsa` above and compare test mean squared error with that of the ridge regression.*
+
+***
+```{r}
+cp_seq <- exp(seq(0, log(1.5), length.out = 20)) -1
+
+n_fold <- 10
+cv_prostate <- cv_fold(prostate_prep_train, n_fold)
+
+build.tree <- function(d, cp){
+  rpart(lpsa ~ ., data.frame(d), control = rpart.control(minsplit = 15,cp = cp))
+}
+predict.tree <- function(d, tree_fit){
+  predict(tree_fit, data.frame(d))
+}
+
+formula <- lpsa ~ .
+model_df2 <- cv_prostate %>%
+             # One row for each combination of cp and fold
+             crossing(cp = cp_seq) %>%
+             mutate(   
+                    # Train model with current fold and cp
+                    model_fit  = map2(train, cp, ~build.tree(.x,.y)),
+                    # Compute predicted valuea on test data
+                    predicted = map2(test, model_fit, ~predict.tree(.x, .y)),
+                    # Extract actual values from test data
+                    actual = map(test, ~(model.frame(formula, .x) %>%
+                                           model.extract("response"))),
+                    # Compute mse
+                    mse = map2_dbl(predicted, actual, ~mean((.x - .y)^2))
+             )
+
+glimpse(model_df2)
+model_df2 %>%
+  group_by(cp) %>%
+  summarise(mse = mean(mse)) %>% 
+    ggplot(aes(x = cp, y = mse)) + geom_point() +
+    geom_line()
+
+```
+
+## Tree bias and variance
+
+Simple decision trees are known for their high variance and small bias. In this part we will look further into this issue by a Monte-Carlo study. In particular, we will look at variance and bias of an estimator $\hat{f}(x)$ of $f(x)$ for various values of fixed $x$. We will do so by
+
+- Choosing a (non-constant) function $f(x)$, $0\leq x\leq 1$, distributions for the input variable $X$ and the observation error $\epsilon$, and a sample size $n$.
+- Simulate $N$ samples of size $n$ from the distributions of $X$ and $Y=f(X)+\epsilon$.
+- For each of the $N$ samples, fit $\hat{f}$, and compute its values on a grid.
+- Approximate bias/variance for each value on the grid by averaging over the $N$ samples.
+
+Here is a simple example, approximating bias, variance and mse of a polynomial regression applied to $f(x)=\sin(5x)$. Note that we are examining performance as a function of $x$ for fixed hyperparameters, rather than mean (over $x$) performance as a function of hyperparameter as before.
+
+```{r}
+# The function to estimate
+f <- function(x){
+    sin(x * 5)
+}
+
+# A function to simulate a sample of size n (uniform X)
+sim_data <- function(n = 100, f. = f, sd = 1/3){
+    data.frame(x = runif(n)) %>% mutate(y = f(x) + rnorm(n, sd = sd))
+}
+
+# Define a grid of points for which
+# performance shoudl be evaluated
+newdata <- data.frame(x = 0:50/50)
+
+# Number of Monte-Carlo samples
+N <- 100
+```
+
+```{r}
+# The function to estimate
+f <- function(x){
+    sin(x * 5)
+}
+
+# A function to simulate a sample of size n (uniform X)
+sim_data <- function(n = 100, f. = f, sd = 1/3){
+    data.frame(x = runif(n)) %>% mutate(y = f(x) + rnorm(n, sd = sd))
+}
+
+# Define a grid of points for which
+# performance shoudl be evaluated
+newdata <- data.frame(x = 0:50/50)
+
+# Number of Monte-Carlo samples
+N <- 100
+
+build.tree <- function(d, minsplit){
+  rpart(y ~ ., data.frame(d), control = rpart.control(minsplit = minsplit))
+}
+
+tibble(data = rerun(N, sim_data())) %>% # Draw N samples
+    # Fit a cubic polynomial
+    mutate(fit = map(data, ~build.tree(.x,15)),
+           predicted = map(fit, ~mutate(newdata, predicted = predict(.x, newdata = newdata)))) %>% 
+    unnest(predicted, .id = "name") %>% 
+    group_by(x) %>% 
+    summarise(bias2 = mean(f(x) - predicted)^2, 
+              variance = var(predicted), 
+              mse = bias2 + variance) %>% 
+    gather(key = "measure", value = "value", -x) %>% 
+    ggplot(aes(x = x, y = value, color = measure)) + 
+    geom_line()
+```
+
+
+For this example (fitting a cubic polynomial to a sine), squared bias and variance seems fairly well balanced.
+
+***
+
+**Task 4**
+
+*Pick your own function and distribution as above and repeat the analysis, fitting an unpruned decision tree using `rpart` instead of a cubic (try a few values of `minsplit`). Do the trees balance variance and squared bias well?*
+
+```{r}
+# The function to estimate
+f <- function(x){
+    sin(x) + cos(x^2) + sin(x)*cos(x)
+}
+
+# A function to simulate a sample of size n (uniform X)
+sim_data <- function(n = 100, f. = f, sd = 1/3){
+    data.frame(x = runif(n)) %>% mutate(y = f(x) + rnorm(n, sd = sd))
+}
+
+# Define a grid of points for which
+# performance should be evaluated
+newdata <- data.frame(x = 0:50/50)
+```
+
+```{r}
+# Number of Monte-Carlo samples
+N <- 100
+tibble(data = rerun(N, sim_data())) %>% # Draw N samples
+  
+    # Fit a cubic polynomial
+    mutate(fit = map(data, ~lm(y ~ poly(x, 3), data = .x)),
+           predicted = map(fit, ~mutate(newdata, predicted = predict(.x, newdata = newdata)))) %>% 
+    unnest(predicted, .id = "name") %>% 
+    group_by(x) %>% 
+    summarise(bias2 = mean(f(x) - predicted)^2, 
+              variance = var(predicted), 
+              mse = bias2 + variance) %>% 
+    gather(key = "measure", value = "value", -x) %>% 
+    ggplot(aes(x = x, y = value, color = measure)) + 
+    geom_line()
+```
+***
+
+***
+
+**Task 5**
+
+*Bagging can be used to reduce variance of trees. It works by averaging trees applied to boostrap samples of data. Write a function*
+```{r, eval = FALSE}
+build.tree <- function(d){
+  rpart(y ~ ., data.frame(d), control = rpart.control(minsplit = 15))
+}
+
+bag_tree <- function(data, newdata = data.frame(x = 0:50/50), B = 10){
+    bootstrap_samples <- tibble(n_sample = 1:B) %>%
+                        mutate(
+                            data = map(n_sample, ~sample_n(data, size=nrow(data), replace=TRUE)),
+                            fit = map(data, ~build.tree(.x) ),
+                            predicted = map(fit, ~mutate(newdata, predicted = predict(.x, newdata = newdata)))
+                        )
+                           
+                        
+    unnest(bootstrap_samples, predicted) %>% 
+              group_by(x) %>% 
+              summarise(predicted = mean(predicted))
+}
+
+newdata <- data.frame(x = 0:50/50)
+data <- data.frame(x = newdata) %>%
+            mutate(y = f(x))
+ans <- bag_tree(data,newdata)
+
+ans %>% ggplot() + 
+      geom_point(aes(x = x, y = predicted)) +
+      stat_function(fun = f)
+```
+
+```{r}
+N <- 100
+tibble(data = rerun(N, sim_data())) %>%
+      mutate(
+        predicted = map(data, ~bag_tree(.x))
+      ) %>%
+      unnest(predicted, .id = "name") %>%
+      group_by(x) %>% 
+      summarise(
+                bias2 = mean(f(x) - predicted)^2, 
+                variance = var(predicted), 
+                mse = bias2 + variance
+      ) %>% 
+      gather(
+            key = "measure", 
+            value = "value", 
+            -x
+      ) %>% 
+      ggplot( aes(x = x, y = value, color = measure) ) + 
+      geom_line()
+
+```
+
+
+*that takes `data` as input, draws `B` Bootstrap resamples (draw with replacement) from data, fits a decision tree (using `rpart`) to each resample and predicts values at `newdata`. The function should then return a `data.frame` with columns `x` and `predicted`, where `predicted` is the average of the resampled predictions. Finally, repeat task 4 with this new function.*
+
+***
