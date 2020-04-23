@@ -9,6 +9,9 @@
 *.out
 *.gz
 
+#RMD
+*.htlm
+
 # History files
 .Rhistory
 .Rapp.history
